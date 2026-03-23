@@ -6,37 +6,24 @@
 #include <mutex>
 #include <thread>
 
-#ifdef __linux__
 #include <cerrno>
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#else
-#include <condition_variable>
-#endif
 
 class FutexConditionVariable {
 public:
     void NotifyOne() {
-#ifdef __linux__
         seq_.fetch_add(1, std::memory_order_release);
         syscall(SYS_futex, &seq_, FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
-#else
-        fallback_.notify_one();
-#endif
     }
 
     void NotifyAll() {
-#ifdef __linux__
         seq_.fetch_add(1, std::memory_order_release);
         syscall(SYS_futex, &seq_, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
-#else
-        fallback_.notify_all();
-#endif
     }
 
     void Wait(std::unique_lock<std::mutex>& lock) {
-#ifdef __linux__
         const std::uint32_t expected = seq_.load(std::memory_order_relaxed);
         lock.unlock();
         while (seq_.load(std::memory_order_acquire) == expected) {
@@ -52,9 +39,6 @@ public:
             }
         }
         lock.lock();
-#else
-        fallback_.wait(lock);
-#endif
     }
 
     template <class Predicate>
@@ -65,11 +49,7 @@ public:
     }
 
 private:
-#ifdef __linux__
     std::atomic<std::uint32_t> seq_{0};
-#else
-    std::condition_variable fallback_;
-#endif
 };
 
 int main() {
