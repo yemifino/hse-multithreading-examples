@@ -1,4 +1,4 @@
-#include <array>
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -19,43 +19,32 @@
 
 namespace {
 
-constexpr std::uint32_t kMagic = 0x49504331;  // "IPC1"
+constexpr std::uint32_t kMagic = 0x49504331;
 constexpr std::uint32_t kVersion = 1;
-constexpr std::size_t kCapacity = 1024;
-constexpr std::size_t kMaxPayload = 256;
-
-static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
-static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+constexpr std::size_t kDefaultShmSize = 1 << 20;
 
 struct MessageHeader {
     std::uint32_t type{};
     std::uint32_t size{};
 };
 
-struct Slot {
-    std::atomic<std::uint64_t> seq{};
-    MessageHeader header{};
-    std::array<std::byte, kMaxPayload> payload{};
-};
-
 struct SharedQueue {
     std::atomic<std::uint32_t> ready{0};
     std::uint32_t magic{};
     std::uint32_t version{};
-    std::uint32_t capacity{};
-    std::uint32_t max_payload{};
+    std::uint64_t capacity_bytes{};
 
     alignas(64) std::atomic<std::uint64_t> head{0};
-    alignas(64) std::atomic<std::uint64_t> tail{0};
-    std::array<Slot, kCapacity> slots{};
+    alignas(64) std::atomic<std::uint64_t> reserve_tail{0};
+    alignas(64) std::atomic<std::uint64_t> publish_tail{0};
 };
 
 struct Message {
     MessageHeader header{};
-    std::vector<std::byte> payload;
+    std::vector<char> payload;
 
     std::string AsString() const {
-        return std::string(reinterpret_cast<const char*>(payload.data()), payload.size());
+        return std::string(payload.data(), payload.size());
     }
 };
 
@@ -71,28 +60,44 @@ std::size_t ParseSize(const char* value, const char* name) {
     }
 }
 
-void InitQueue(SharedQueue& q) {
+void WriteRing(char* ring, std::size_t capacity, std::uint64_t abs_pos, const void* src, std::size_t size) {
+    const std::size_t offset = static_cast<std::size_t>(abs_pos % capacity);
+    const std::size_t first = std::min(size, capacity - offset);
+    std::memcpy(ring + offset, src, first);
+    if (size > first) {
+        std::memcpy(ring, static_cast<const char*>(src) + first, size - first);
+    }
+}
+
+void ReadRing(const char* ring, std::size_t capacity, std::uint64_t abs_pos, void* dst, std::size_t size) {
+    const std::size_t offset = static_cast<std::size_t>(abs_pos % capacity);
+    const std::size_t first = std::min(size, capacity - offset);
+    std::memcpy(dst, ring + offset, first);
+    if (size > first) {
+        std::memcpy(static_cast<char*>(dst) + first, ring, size - first);
+    }
+}
+
+void InitQueue(SharedQueue& q, std::size_t mapped_bytes) {
+    const std::size_t payload_bytes = mapped_bytes - sizeof(SharedQueue);
+    if (payload_bytes < sizeof(MessageHeader)) {
+        throw std::runtime_error("shared memory size is too small for protocol");
+    }
+
     q.ready.store(0, std::memory_order_relaxed);
     q.magic = kMagic;
     q.version = kVersion;
-    q.capacity = static_cast<std::uint32_t>(kCapacity);
-    q.max_payload = static_cast<std::uint32_t>(kMaxPayload);
+    q.capacity_bytes = static_cast<std::uint64_t>(payload_bytes);
     q.head.store(0, std::memory_order_relaxed);
-    q.tail.store(0, std::memory_order_relaxed);
-
-    for (std::size_t i = 0; i < kCapacity; ++i) {
-        q.slots[i].seq.store(i, std::memory_order_relaxed);
-        q.slots[i].header = {};
-    }
+    q.reserve_tail.store(0, std::memory_order_relaxed);
+    q.publish_tail.store(0, std::memory_order_relaxed);
 
     q.ready.store(1, std::memory_order_release);
 }
 
-void CheckQueue(const SharedQueue& q) {
-    if (q.magic != kMagic ||
-        q.version != kVersion ||
-        q.capacity != kCapacity ||
-        q.max_payload != kMaxPayload) {
+void CheckQueue(const SharedQueue& q, std::size_t mapped_bytes) {
+    const std::size_t payload_bytes = mapped_bytes - sizeof(SharedQueue);
+    if (q.magic != kMagic || q.version != kVersion || q.capacity_bytes != payload_bytes) {
         throw std::runtime_error("protocol mismatch");
     }
 }
@@ -101,7 +106,7 @@ class SharedMemory {
 public:
     SharedMemory(const std::string& name, bool create, std::size_t bytes)
         : bytes_(bytes) {
-        if (bytes_ < sizeof(SharedQueue)) {
+        if (bytes_ < sizeof(SharedQueue) + sizeof(MessageHeader)) {
             throw std::runtime_error("shared memory size is too small");
         }
 
@@ -138,7 +143,7 @@ public:
             ThrowErrno("fstat failed");
         }
         bytes_ = static_cast<std::size_t>(st.st_size);
-        if (bytes_ < sizeof(SharedQueue)) {
+        if (bytes_ < sizeof(SharedQueue) + sizeof(MessageHeader)) {
             throw std::runtime_error("shared memory object is too small");
         }
 
@@ -149,12 +154,12 @@ public:
         queue_ = static_cast<SharedQueue*>(ptr);
 
         if (created) {
-            InitQueue(*queue_);
+            InitQueue(*queue_, bytes_);
         } else {
             while (queue_->ready.load(std::memory_order_acquire) != 1) {
                 std::this_thread::yield();
             }
-            CheckQueue(*queue_);
+            CheckQueue(*queue_, bytes_);
         }
     }
 
@@ -183,32 +188,37 @@ private:
 class ProducerNode {
 public:
     explicit ProducerNode(const std::string& shm_path, std::size_t shm_size)
-        : shm_(shm_path, true, shm_size), q_(shm_.Get()) {
+        : shm_(shm_path, true, shm_size), q_(shm_.Get()), ring_(reinterpret_cast<char*>(q_) + sizeof(SharedQueue)) {
     }
 
     bool Send(std::uint32_t type, const void* data, std::uint32_t size) {
-        if (size > kMaxPayload) {
+        const std::uint64_t message_bytes = sizeof(MessageHeader) + static_cast<std::uint64_t>(size);
+        if (message_bytes > q_->capacity_bytes) {
             return false;
         }
 
         while (true) {
-            const std::uint64_t pos = q_->tail.load(std::memory_order_relaxed);
-            Slot& slot = q_->slots[pos % kCapacity];
-            const std::uint64_t seq = slot.seq.load(std::memory_order_acquire);
-            const std::intptr_t diff = static_cast<std::intptr_t>(seq) - static_cast<std::intptr_t>(pos);
+            const std::uint64_t tail = q_->reserve_tail.load(std::memory_order_relaxed);
+            const std::uint64_t head = q_->head.load(std::memory_order_acquire);
+            const std::uint64_t used = tail - head;
+            const std::uint64_t free = q_->capacity_bytes - used;
+            if (message_bytes > free) {
+                return false;
+            }
 
-            if (diff == 0) {
-                std::uint64_t expected = pos;
-                if (q_->tail.compare_exchange_weak(expected, pos + 1, std::memory_order_acq_rel)) {
-                    slot.header = {type, size};
-                    if (size > 0) {
-                        std::memcpy(slot.payload.data(), data, size);
-                    }
-                    slot.seq.store(pos + 1, std::memory_order_release);
-                    return true;
+            std::uint64_t expected = tail;
+            if (q_->reserve_tail.compare_exchange_weak(expected, tail + message_bytes, std::memory_order_acq_rel)) {
+                const MessageHeader header{type, size};
+                WriteRing(ring_, static_cast<std::size_t>(q_->capacity_bytes), tail, &header, sizeof(header));
+                if (size > 0) {
+                    WriteRing(ring_, static_cast<std::size_t>(q_->capacity_bytes), tail + sizeof(header), data, size);
                 }
-            } else if (diff < 0) {
-                return false;  // queue full
+
+                while (q_->publish_tail.load(std::memory_order_acquire) != tail) {
+                    std::this_thread::yield();
+                }
+                q_->publish_tail.store(tail + message_bytes, std::memory_order_release);
+                return true;
             }
         }
     }
@@ -220,12 +230,13 @@ public:
 private:
     SharedMemory shm_;
     SharedQueue* q_;
+    char* ring_;
 };
 
 class ConsumerNode {
 public:
     explicit ConsumerNode(const std::string& shm_path, std::size_t shm_size)
-        : shm_(shm_path, false, shm_size), q_(shm_.Get()) {
+        : shm_(shm_path, false, shm_size), q_(shm_.Get()), ring_(reinterpret_cast<char*>(q_) + sizeof(SharedQueue)) {
     }
 
     std::optional<Message> Receive(std::optional<std::uint32_t> filter = std::nullopt) {
@@ -237,45 +248,51 @@ public:
             if (!filter || message->header.type == *filter) {
                 return message;
             }
-            // drop message with another type
         }
     }
 
 private:
     std::optional<Message> TryPop() {
-        while (true) {
-            const std::uint64_t pos = q_->head.load(std::memory_order_relaxed);
-            Slot& slot = q_->slots[pos % kCapacity];
-            const std::uint64_t seq = slot.seq.load(std::memory_order_acquire);
-            const std::intptr_t diff = static_cast<std::intptr_t>(seq) - static_cast<std::intptr_t>(pos + 1);
-
-            if (diff == 0) {
-                q_->head.store(pos + 1, std::memory_order_relaxed);
-
-                if (slot.header.size > kMaxPayload) {
-                    throw std::runtime_error("corrupted message size");
-                }
-
-                Message out;
-                out.header = slot.header;
-                out.payload.resize(out.header.size);
-                if (!out.payload.empty()) {
-                    std::memcpy(out.payload.data(), slot.payload.data(), out.payload.size());
-                }
-
-                slot.seq.store(pos + kCapacity, std::memory_order_release);
-                return out;
-            }
-
-            if (diff < 0) {
-                return std::nullopt;  // queue empty
-            }
+        const std::uint64_t head = q_->head.load(std::memory_order_relaxed);
+        const std::uint64_t published = q_->publish_tail.load(std::memory_order_acquire);
+        if (head == published) {
+            return std::nullopt;
         }
+
+        const std::uint64_t available = published - head;
+        if (available < sizeof(MessageHeader)) {
+            return std::nullopt;
+        }
+
+        MessageHeader header{};
+        ReadRing(ring_, static_cast<std::size_t>(q_->capacity_bytes), head, &header, sizeof(header));
+        const std::uint64_t message_bytes = sizeof(MessageHeader) + static_cast<std::uint64_t>(header.size);
+        if (message_bytes > q_->capacity_bytes) {
+            throw std::runtime_error("corrupted message size");
+        }
+        if (message_bytes > available) {
+            return std::nullopt;
+        }
+
+        Message out;
+        out.header = header;
+        out.payload.resize(header.size);
+        if (!out.payload.empty()) {
+            ReadRing(ring_,
+                     static_cast<std::size_t>(q_->capacity_bytes),
+                     head + sizeof(MessageHeader),
+                     out.payload.data(),
+                     out.payload.size());
+        }
+
+        q_->head.store(head + message_bytes, std::memory_order_release);
+        return out;
     }
 
 private:
     SharedMemory shm_;
     SharedQueue* q_;
+    const char* ring_;
 };
 
 void PrintUsage(const char* exe) {
@@ -296,7 +313,7 @@ int RunProducer(int argc, char** argv) {
     const std::uint32_t type = static_cast<std::uint32_t>(ParseSize(argv[3], "message_type"));
     const std::size_t count = ParseSize(argv[4], "count");
     const std::string prefix = (argc >= 6) ? argv[5] : "msg";
-    const std::size_t shm_size = (argc >= 7) ? ParseSize(argv[6], "shm_size") : sizeof(SharedQueue);
+    const std::size_t shm_size = (argc >= 7) ? ParseSize(argv[6], "shm_size") : kDefaultShmSize;
 
     ProducerNode producer(shm_path, shm_size);
     for (std::size_t i = 0; i < count; ++i) {
@@ -321,7 +338,7 @@ int RunConsumer(int argc, char** argv) {
     const std::optional<std::uint32_t> filter =
         (argc >= 5) ? std::optional<std::uint32_t>(static_cast<std::uint32_t>(ParseSize(argv[4], "filter_type")))
                     : std::nullopt;
-    const std::size_t shm_size = (argc >= 6) ? ParseSize(argv[5], "shm_size") : sizeof(SharedQueue);
+    const std::size_t shm_size = (argc >= 6) ? ParseSize(argv[5], "shm_size") : kDefaultShmSize;
 
     ConsumerNode consumer(shm_path, shm_size);
 
@@ -346,7 +363,7 @@ int RunConsumer(int argc, char** argv) {
     return 0;
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
     try {
